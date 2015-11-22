@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html>
+ <head>
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>Gene View</title>
+  <script src="Three.js"></script>
+  <link type="text/css" href="http://ajax.googleapis.com/ajax/libs/jqueryui/1.8/themes/base/jquery-ui.css" rel="Stylesheet" />
+  <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js"></script>
+  <script src="https://ajax.googleapis.com/ajax/libs/jqueryui/1.8.21/jquery-ui.min.js"></script>
+  <style type="text/css">
+   * {margin:0;}
+   body {background-color:#222222; }
+   h3, p {color:#DDDDDD; }
+   p {font-size:1.2em; }
+   div {position:absolute; display:block; }
+   .block {width:17px; height:17px; display:inline-block; position:relative; border:1px solid; }
+   #seq {height:19px; }
+   #slider {margin:5px 0; }
+  </style>
+ </head>
+ <body>
+  <div id="container"></div>
+  <div id="controls">
+	  <h3 id="name">Loading... <img src="ajax-loader.gif" /></h3>
+   <span style="color:#FF7F7F;">A</span>
+   <span style="color:#BFFF7F;">T</span>
+   <span style="color:#7FFFFF;">C</span>
+   <span style="color:#BF7FFF;">G</span>
+   <div id="seq"></div>
+   <br />
+   <br />
+   <p id="intersecting"></p>
+   <p id="threshold"></p>
+   <div id="slider"></div>
+  </div>
+  <script>
+   var geneData, threshold = 2.0,
+   camera, controls, scene, projector, renderer, mouse = new THREE.Vector2(),
+   amLight, aboveDirLight, belowDirLight,
+   promoterRegion, endCap, codingRegion, promoterGeometry,
+   WIDTH, HEIGHT;
+
+   $(function(){
+    loadFileData(); //when ready begin loading data from file (in finished version data will be passed in via json)
+   });
+  
+   function loadFileData()
+   {
+    var fileUrl = 'AT3G37492.txt';
+    $.get(fileUrl, function(data) {
+      parseData(data); //load the data into the geneData object
+      init(); //start main initialisation
+      $('#slider').slider({ //set up the slider for the threshold
+       min: 0.0,
+       max: 3.0,
+       step: 0.01,
+       slide: function(event, ui) {
+	threshold = ui.value;
+	updateVisibility();
+       },
+       change: function(event, ui) {
+	threshold = ui.value;
+	updateVisibility();
+       },
+      });
+      $('#slider').slider('value', threshold); //set the initial threshold value
+      animate(); //start animation loop
+     }, 'text');
+   }
+
+   function parseData(rawData) //interesting stuff
+   {
+    rawData = rawData.split('\n');
+    geneData = {
+     name : (rawData[0].split('|')[0]).substring(1),
+     length : parseInt(rawData[0].split('|')[1]),
+     sequence : rawData[1],
+     proteins : [],
+    }
+
+    for (var i = 2; i < rawData.length; i++)
+    {
+     if (rawData[i] == "") break; //sometimes there is a newline at the end of the file (unix behaviour?)
+     var splitData = rawData[i].split('\t'),
+     currentProteinData = {
+      id : splitData[0],
+      length : parseInt(splitData[1]),
+      min : parseFloat(splitData[2]),
+      max : parseFloat(splitData[3]),
+      mean : parseFloat(splitData[4]),
+      variance : parseFloat(splitData[5]),
+      threshold : parseFloat(splitData[6]),
+      positiveScores : [],
+      negativeScores : [],
+     },
+     numScores = geneData.length - currentProteinData.length;
+     for (var j = 0; j <= numScores; j++)
+     {
+      currentProteinData.positiveScores.push(parseFloat(splitData[7 + j]));
+      currentProteinData.negativeScores.push(parseFloat(splitData[7 + 1 + numScores + j]));
+     }
+
+     geneData.proteins.push(currentProteinData);
+    }
+   }
+
+   function init()
+   {
+    $('#name').html(geneData.name + ' length: ' + geneData.length); //annotate the visualistion with the name and length
+    WIDTH = window.innerWidth, HEIGHT = window.innerHeight - 5; //5 less to stop scroll bars popping up (could just be my tiny monitor)
+    var VIEW_ANGLE = 45, ASPECT = WIDTH / HEIGHT, NEAR = 0.1, FAR = 10000;
+    
+    renderer = new THREE.WebGLRenderer({antialias:true});
+    camera = new THREE.PerspectiveCamera(VIEW_ANGLE, ASPECT, NEAR, FAR);
+    camera.position.set(0, 0, 100 + geneData.length * 0.9);
+    scene = new THREE.Scene();
+    renderer.setSize(WIDTH, HEIGHT);
+    $('#container').append(renderer.domElement);
+
+    //set up the lights for the scene.
+    aboveDirLight = new THREE.DirectionalLight(0xFFFFFF, 1, 10);
+    aboveDirLight.position.set(1, 1, 1).normalize();
+    belowDirLight = new THREE.DirectionalLight(0xFFFFFF, 0.8, 10);
+    belowDirLight.position.set(-1, -1, -1).normalize();
+    amLight = new THREE.AmbientLight(0x111111);
+
+    //set up meshes for all the proteins
+    for (var n = 0; n < geneData.proteins.length; n++)
+    {
+     var proteinData = geneData.proteins[n];
+     proteinData.positiveMeshes = [];
+     proteinData.negativeMeshes = [];
+
+     //auto assign a colour for the protein
+     proteinData.color = new THREE.Color(0xFFFFFF);
+     proteinData.color.setHSV(n / geneData.proteins.length, 0.5, 1.0);
+
+     //place a label of correct colour on the list
+     $('#controls').append(($('<p/>', {
+      css: {
+       color: '#' + proteinData.color.getHex().toString(16),
+      },
+      text: proteinData.id + ' ',
+     })).append($('<input/>', {
+      id: 'check'+n,
+      type: 'checkbox',
+      checked: true,
+      click: function() { updateVisibility() },
+     })));
+     var proteinMaterial = new THREE.MeshLambertMaterial({color: proteinData.color.getHex(), opacity:0.6, transparent: true}),
+     proteinGeometry = new THREE.CylinderGeometry(15, 15, proteinData.length, 20, 1, false);
+     for (var i = 0;  i < proteinData.positiveScores.length; i++)
+     {
+      var positiveMesh = new THREE.Mesh(proteinGeometry, proteinMaterial),
+      negativeMesh = new THREE.Mesh(proteinGeometry, proteinMaterial);
+      positiveMesh.rotation.z = Math.PI / 2;
+      negativeMesh.rotation.z = Math.PI / 2;
+      positiveMesh.position.y = 5;
+      negativeMesh.position.y = -5;
+      positiveMesh.position.x = (proteinData.length - geneData.length) / 2 + i;
+      negativeMesh.position.x = (proteinData.length - geneData.length) / 2 + i;
+      proteinData.positiveMeshes.push(positiveMesh);
+      proteinData.negativeMeshes.push(negativeMesh);
+      scene.add(positiveMesh);
+      scene.add(negativeMesh);
+     } 
+    }
+
+    //set up materials for remaining sections of the visualisation.
+    var promoterMaterial = new THREE.MeshLambertMaterial({color:0xFFFFFF, shading: THREE.SmoothShading, vertexColors: THREE.VertexColors }),
+    endMaterial = new THREE.MeshLambertMaterial({color:0xDD00DD}),
+    codingMaterial = new THREE.MeshLambertMaterial({color:0xDD0000});
+
+    //set up meshes for the sections.
+    promoterGeometry = new THREE.CylinderGeometry(10, 10, geneData.length, 20, geneData.length, true);
+    //set up color for the promoter sequence.
+    for (var i = 0; i < promoterGeometry.faces.length; i++)
+    {
+     var f = promoterGeometry.faces[i];
+     for (var j = 0; j < 4; j++)
+     {
+      f.vertexColors[j] = getPairColour(i % geneData.length);
+     }
+    }
+    promoterRegion = new THREE.Mesh(
+    promoterGeometry,
+    promoterMaterial);
+    endCap = new THREE.Mesh(
+    new THREE.CylinderGeometry(20, 20, 5, 20, 1, false),
+    endMaterial);
+    codingRegion = new THREE.Mesh(
+    new THREE.CylinderGeometry(20, 20, 50, 20, 1, false),
+    codingMaterial);
+
+    //place the meshes in their correct positions.
+    //rotate meshes
+    promoterRegion.rotation.z = Math.PI / 2;
+    codingRegion.rotation.z = Math.PI / 2;
+    endCap.rotation.z = Math.PI / 2;
+    //move meshes
+    codingRegion.position.x = (geneData.length / 2) + 25;
+    endCap.position.x = -(geneData.length / 2) - 2.5;
+
+    //add the meshes to the scene.
+    scene.add(promoterRegion);
+    scene.add(endCap);
+    scene.add(codingRegion);
+
+    //add the camera and lights to the scene.
+    scene.add(camera);
+    scene.add(aboveDirLight);
+    scene.add(belowDirLight);
+    scene.add(amLight);
+
+    //set up controls.
+    controls = new THREE.TrackballControls(camera, renderer.domElement);
+
+    controls.rotateSpeed = 1.2;
+    controls.zoomSpeed = 1.4;
+    controls.panSpeed = 0.8;
+    
+    controls.noZoom = false;
+    controls.noPan = false;
+    
+    controls.staticMoving = true;
+    controls.dynamicDampingFactor = 0.3;
+    
+    controls.keys = [ 65, 83, 68 ];
+    controls.addEventListener('change', render);
+
+    projector = new THREE.Projector();
+
+    renderer.domElement.addEventListener('mousemove', onDocumentMouseMove, false);
+
+    $('#intersecting').html('0 0');
+   }
+
+   function onDocumentMouseMove(event)
+   {
+    mouse.x = (event.clientX / (WIDTH-1)) * 2 - 1;
+    mouse.y =  - (event.clientY / (HEIGHT-1)) * 2 + 1;
+
+    var vector = new THREE.Vector3(mouse.x, mouse.y, 0.5);
+    projector.unprojectVector(vector, camera);
+
+    var ray = new THREE.Ray(camera.position, vector.subSelf(camera.position).normalize());
+
+    var visibleIntersects = [],
+    startPoint,
+    length,
+    color;
+    for (var n = 0; n < geneData.proteins.length; n++)
+    {
+     var intersects = ray.intersectObjects(geneData.proteins[n].positiveMeshes);
+     for (var i = 0; i < intersects.length; i++)
+     {
+      if (intersects[i].object.visible)
+      {
+       visibleIntersects.push(intersects[i]);
+       startPoint = geneData.proteins[n].positiveMeshes.indexOf(intersects[i].object);
+       length = geneData.proteins[n].length;
+       proteinColor = geneData.proteins[n].color;
+      }
+     }
+     intersects = ray.intersectObjects(geneData.proteins[n].negativeMeshes);
+     for (var i = 0; i < intersects.length; i++)
+     {
+      if (intersects[i].object.visible)
+      {
+       visibleIntersects.push(intersects[i]);
+       startPoint = geneData.proteins[n].negativeMeshes.indexOf(intersects[i].object);
+       length = geneData.proteins[n].length;
+       proteinColor = geneData.proteins[n].color;
+      }
+     }
+    }
+
+    if (visibleIntersects.length > 0)
+    {
+     displaySequence(startPoint, length);
+     $('#intersecting').html(startPoint + ' ' + length).css('color', '#' + proteinColor.getHex().toString(16));
+    }
+   }
+
+   function displaySequence(start, length)
+   {
+    $('#seq').html('');
+    for (var n = 0; n < length; n++)
+    {
+     $('#seq').append($('<div/>', {
+      css: {
+       'background-color': '#' + getPairColour(start + n).getHex().toString(16),
+      },
+      class: 'block',
+     }));
+    }
+   }
+
+   function updateVisibility()
+   {
+    $('#threshold').html('Threshold: ' + threshold);
+    for (var n = 0; n < geneData.proteins.length; n++)
+    {
+     var proteinData = geneData.proteins[n],
+     proteinVisible = $('#check'+n).attr('checked');
+     for (var i = 0; i < proteinData.positiveMeshes.length; i++)
+     {
+      proteinData.positiveMeshes[i].visible = proteinVisible && (proteinData.positiveScores[i] > threshold);
+      proteinData.negativeMeshes[i].visible = proteinVisible && (proteinData.negativeScores[i] > threshold);
+     }
+    }
+   }
+
+   function getPairColour(pairNum)
+   {
+    var color = new THREE.Color(0xFFFFFF),
+    base = geneData.sequence[pairNum];
+    if (base == 'A')
+    {
+     color.setHSV(0,0.5,1.0);
+    }
+    else if (base == 'T')
+    {
+     color.setHSV(0.25,0.5,1.0);
+    }
+    else if (base == 'C')
+    {
+     color.setHSV(0.5,0.5,1.0);
+    }
+    else //if (base == 'G')
+    {
+     color.setHSV(0.75,0.5,1.0);
+    }
+    return color;
+   }
+
+   function animate()
+   {
+    requestAnimationFrame(animate);
+    controls.update();
+    render();
+   }
+
+   function render()
+   {
+    //render!
+    renderer.render(scene, camera);
+   }
+  </script>
+ </body>
+</html>
